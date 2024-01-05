@@ -22,6 +22,11 @@ it will be organized and encrypted
 
 ## Todos:
 
+1. ~~create input element~~
+2. create a caret
+3. tokeniser
+4. editor
+
 # Day 1:
 
-\*create input element
+- create input element - almost done
