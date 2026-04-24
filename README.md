@@ -2,6 +2,8 @@
 
 A powerful rich text editor built with Rust and Iced, featuring line-level control and MS Word-like functionality.
 
+### WIP: Just Started and do not work on it that often. But would like to get atleast basic functionality up and running as 
+
 ## Features
 
 ### Rich Text Editing

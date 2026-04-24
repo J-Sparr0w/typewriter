@@ -1,79 +1,176 @@
-use std::f32;
+use std::{cell::Cell, f32, time::Instant};
 
 use iced::{
-    Border, Color, Element, Font, Length, Padding, Pixels, Point, Rectangle, Shadow,
-    Size, Theme,
     advanced::{
-        Layout, Text, Widget, input_method,
-        layout, mouse,
+        input_method, layout, mouse,
         renderer::{self, Quad},
-        text::{LineHeight, Paragraph, Renderer, Shaping, Wrapping},
-        widget::{Tree, operation, tree},
-        Renderer as IcedRenderer,
+        text::{paragraph, Highlight, Paragraph, Wrapping},
+        widget::{operation, tree, Tree},
+        Layout, Text, Widget,
     },
     alignment,
-    widget::{self, text},
+    font::Weight,
+    widget::{
+        self, rich_text,
+        text::{self, LineHeight, Span},
+        text_editor::{Binding, KeyPress},
+    },
+    Alignment, Border, Color, Element, Font, Length, Padding, Pixels, Point, Rectangle, Shadow,
+    Size, Theme, Vector,
 };
 
-#[derive(Debug, Clone)]
-pub enum Message {
-    TextChanged(String),
-    LineSelected(usize),
-    LineMoved { from: usize, to: usize },
+use ropey::{Rope, RopeSlice};
+
+use crate::document_model::{Document, Formatting, Line, RichTextSpan};
+
+// pub enum
+//
+
+#[derive(Debug, Default, Clone)]
+struct RenderLine {
+    // index of the starting segment of line
+    start: usize,
+    // index of the ending segment of line
+    end: usize,
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct RichSpan {
-    pub text: String,
-    pub font: Font,
-    pub size: f32,
-    pub color: Color,
-    pub bold: bool,
-    pub italic: bool,
-    pub underline: bool,
+#[derive(Debug, Default, Clone)]
+struct RenderParagraph<P: Paragraph<Font = iced::Font>> {
+    // A segment is just a Renderer::Paragraph
+    segments: Vec<P>,
+    // A line can have 1 or more segments
+    // When a new line starts, a new segment is created
+    lines: Vec<RenderLine>,
 }
 
-impl Default for RichSpan {
-    fn default() -> Self {
-        Self {
-            text: String::new(),
-            font: Font::default(),
-            size: 16.0,
-            color: Color::BLACK,
-            bold: false,
-            italic: false,
-            underline: false,
-        }
-    }
-}
 
-#[derive(Debug, Clone)]
-pub struct RichLine {
-    pub spans: Vec<RichSpan>,
-    pub selected: bool,
-}
-
-impl RichLine {
+impl<P: Paragraph<Font = iced::Font>> RenderParagraph<P> {
     pub fn new() -> Self {
-        Self {
-            spans: vec![RichSpan::default()],
-            selected: false,
-        }
+        Self::default()
     }
 
-    pub fn text(&self) -> String {
-        self.spans.iter().map(|span| span.text.as_str()).collect()
-    }
-
-    pub fn set_text(&mut self, text: String) {
-        if self.spans.is_empty() {
-            self.spans.push(RichSpan::default());
+    pub fn add_segment(&mut self, line_idx: usize, paragraph: P) {
+        if let Some(line) = self.lines.get_mut(line_idx) {
+            // TODO: This is just dummy code, this probably displays text in the opposite order
+            self.segments.insert(line_idx, paragraph);
+            line.end += 1;
+        } else {
+            self.segments.push(paragraph);
+            self.lines.push(RenderLine {
+                start: line_idx,
+                end: line_idx,
+            });
         }
-        self.spans[0].text = text;
     }
 }
 
-pub struct RichTextEditor<'a> {
+fn build_paragraphs<P: Paragraph<Font = iced::Font>, Renderer>(
+    doc: &Document,
+    renderer: &Renderer,
+    bounds: Size<f32>,
+) -> RenderParagraph<P>
+where
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>,
+{
+    let lines: &[Line] = doc.lines_ref();
+    let mut render_paragraph = RenderParagraph::new();
+
+    let default_align_x = text::Alignment::Default;
+    let default_align_y = alignment::Vertical::Center;
+    let default_shaping = text::Shaping::Advanced;
+    let default_wrapping = text::Wrapping::default();
+
+    for (i, line) in lines.iter().enumerate() {
+        let line_idx = i;
+
+        if line.needs_multiple_fonts() {
+            let mut iter = line.spans.iter();
+            let first = iter
+                .next()
+                .expect("Calling next span won't cause panic cause it is checked elsewhere");
+            let prev_font = first.formatting.font_style;
+
+            let mut start = first.start;
+            let mut end = first.end;
+            let last_idx = line.spans.len() - 1;
+
+            for (i, span) in iter.enumerate() {
+                let curr_font = span.formatting.font_style;
+                if curr_font == prev_font {
+                    end = span.end;
+                } else {
+                    // create a paragraph and add it to cache and start a new one
+                    let content = doc.content(start, end).to_string();
+                    let text: Text<&str, iced::Font> = Text {
+                        content: &content,
+                        bounds: bounds,
+                        size: line.format.size.unwrap_or_else(|| renderer.default_size()),
+                        line_height: line
+                            .format
+                            .line_height
+                            .unwrap_or_else(|| LineHeight::default()),
+                        font: line.format.font.unwrap_or_else(|| renderer.default_font()),
+                        align_x: line.format.align_x.unwrap_or(text::Alignment::Default),
+                        align_y: line.format.align_y.unwrap_or(default_align_y),
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::default(),
+                    };
+                    render_paragraph.add_segment(line_idx, Paragraph::with_text(text));
+
+                    start = end;
+                    end = span.end
+                }
+
+                if i == last_idx {
+                    let content = doc.content(start, end).to_string();
+                    let text: Text<&str, iced::Font> = Text {
+                        content: &content,
+                        bounds: bounds,
+                        size: line.format.size.unwrap_or_else(|| renderer.default_size()),
+                        line_height: line
+                            .format
+                            .line_height
+                            .unwrap_or_else(|| LineHeight::default()),
+                        font: line.format.font.unwrap_or_else(|| renderer.default_font()),
+                        align_x: line.format.align_x.unwrap_or(text::Alignment::Default),
+                        align_y: line.format.align_y.unwrap_or(default_align_y),
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::default(),
+                    };
+                    render_paragraph.add_segment(line_idx, Paragraph::with_text(text));
+                }
+            }
+        } else {
+            let (start, end) = line.text_span();
+            let content = doc.content(start, end).to_string();
+            let text: Text<&str, iced::Font> = Text {
+                content: &content,
+                bounds: bounds,
+                size: line.format.size.unwrap_or_else(|| renderer.default_size()),
+                line_height: line
+                    .format
+                    .line_height
+                    .unwrap_or_else(|| LineHeight::default()),
+                font: line.format.font.unwrap_or_else(|| renderer.default_font()),
+                align_x: line.format.align_x.unwrap_or(text::Alignment::Default),
+                align_y: line.format.align_y.unwrap_or(default_align_y),
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::default(),
+            };
+            render_paragraph.add_segment(line_idx, Paragraph::with_text(text));
+        }
+    }
+
+    render_paragraph
+}
+
+enum Action {
+    Insert(char),
+    DeleteBack,
+    DeleteForward,
+}
+
+pub struct RichTextEditor<'a, Message> {
     id: Option<widget::Id>,
     font: Option<iced::Font>,
     text_size: Option<Pixels>,
@@ -85,16 +182,14 @@ pub struct RichTextEditor<'a> {
     padding: Padding,
     alignment: alignment::Horizontal,
     wrapping: Wrapping,
-    on_change: Option<Box<dyn Fn(String) -> Message + 'a>>,
-    on_line_select: Option<Box<dyn Fn(usize) -> Message + 'a>>,
-    on_line_move: Option<Box<dyn Fn(usize, usize) -> Message + 'a>>,
+    key_binding: Option<Box<dyn Fn(KeyPress) -> Option<Binding<Message>> + 'a>>,
 }
 
-impl<'a> RichTextEditor<'a> {
+impl<'a, Message> RichTextEditor<'a, Message> {
     pub fn new() -> Self {
         Self {
             id: None,
-            font: None,
+            font: Some(iced::Font::DEFAULT),
             text_size: None,
             line_height: LineHeight::default(),
             width: Length::Fill,
@@ -104,44 +199,43 @@ impl<'a> RichTextEditor<'a> {
             padding: Padding::new(5.0),
             alignment: alignment::Horizontal::Left,
             wrapping: Wrapping::default(),
-            on_change: None,
-            on_line_select: None,
-            on_line_move: None,
+            key_binding: None,
         }
-    }
-
-    pub fn on_change<F>(mut self, callback: F) -> Self
-    where
-        F: Fn(String) -> Message + 'a,
-    {
-        self.on_change = Some(Box::new(callback));
-        self
-    }
-
-    pub fn on_line_select<F>(mut self, callback: F) -> Self
-    where
-        F: Fn(usize) -> Message + 'a,
-    {
-        self.on_line_select = Some(Box::new(callback));
-        self
-    }
-
-    pub fn on_line_move<F>(mut self, callback: F) -> Self
-    where
-        F: Fn(usize, usize) -> Message + 'a,
-    {
-        self.on_line_move = Some(Box::new(callback));
-        self
     }
 }
 
-impl<'a> From<RichTextEditor<'a>> for Element<'a, Message, Theme, iced::Renderer> {
-    fn from(editor: RichTextEditor<'a>) -> Self {
+impl<'a, Message, Renderer> From<RichTextEditor<'a, Message>>
+    for Element<'a, Message, Theme, Renderer>
+where
+    Message: 'a,
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>,
+{
+    fn from(editor: RichTextEditor<'a, Message>) -> Self {
         Self::new(editor)
     }
 }
 
-impl<'a> Widget<Message, Theme, iced::Renderer> for RichTextEditor<'a> {
+#[derive(Debug, Default, Clone)]
+pub struct EditorState<P: Paragraph<Font = iced::Font>> {
+    // is_focused: Option<Focus>,
+    // is_dragging: Option<Drag>,
+    // is_pasting: Option<Value>,
+    // preedit: Option<input_method::Preedit>,
+    last_click: Option<mouse::Click>,
+    cursor: Cursor,
+    document: Document,
+    requires_redraw: Cell<bool>,
+    render_cache: RenderParagraph<P>,
+    // last_span_start: usize,
+    // last_span: RichTextSpan,
+    // keyboard_modifiers: keyboard::Modifiers,
+    // TODO: Add stateful horizontal scrolling offset
+}
+
+impl<'a, Message, Renderer> Widget<Message, Theme, Renderer> for RichTextEditor<'a, Message>
+where
+    Renderer: iced::advanced::text::Renderer<Font = iced::Font>,
+{
     fn size(&self) -> Size<Length> {
         Size {
             width: self.width,
@@ -150,23 +244,22 @@ impl<'a> Widget<Message, Theme, iced::Renderer> for RichTextEditor<'a> {
     }
 
     fn tag(&self) -> tree::Tag {
-        tree::Tag::of::<EditorState>()
+        tree::Tag::of::<EditorState<Renderer::Paragraph>>()
     }
 
     fn state(&self) -> tree::State {
-        tree::State::new(EditorState::new())
+        tree::State::new(EditorState::<Renderer::Paragraph>::new())
     }
 
     fn layout(
         &mut self,
         tree: &mut Tree,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
         limits: &layout::Limits,
     ) -> layout::Node {
-        let state = tree.state.downcast_mut::<EditorState>();
-        // // let value = value.unwrap_or(&self.value);
-
-        // let font = self.font.unwrap_or_else(|| renderer.default_font());
+        let state = tree
+            .state
+            .downcast_mut::<EditorState<Renderer::Paragraph>>();
         let text_size = self.text_size.unwrap_or_else(|| renderer.default_size());
         let padding = self.padding.fit(Size::ZERO, limits.max());
         let height = self.line_height.to_absolute(text_size);
@@ -174,18 +267,44 @@ impl<'a> Widget<Message, Theme, iced::Renderer> for RichTextEditor<'a> {
         let limits = limits.width(self.width).shrink(padding);
         let text_bounds = limits.resolve(self.width, height, Size::ZERO);
 
-        // let placeholder_text = Text {
-        //     font,
-        //     line_height: self.line_height,
-        //     content: self.placeholder.as_str(),
-        //     bounds: Size::new(f32::INFINITY, text_bounds.height),
+        println!("Layout function in action");
+
+        state.render_cache = build_paragraphs(&state.document, renderer, text_bounds);
+
+        // let spans: Vec<RichTextSpan> = state.document.lines.iter().flat_map(|l| l.spans.iter()).map(|&s| s).collect();
+        // dbg!(&state.document);
+        // let to_span = |s:&RichTextSpan| -> Span {
+        //     let text = state.document.text.slice(s.start..s.end);
+        //         // .slice
+        //         // .expect("HOW DID THE SLICE GET EMPTY")
+        //         // .as_str()
+        //         // .expect("Converting a rope slice to a &str is the culprit");
+        //     Span {
+        //         text: text.into(),
+        //         size: s.size,
+        //         line_height: s.line_height,
+        //         font: s.font,
+        //         color: s.color,
+        //         link: s.link,
+        //         highlight: s.highlight,
+        //         padding: s.padding,
+        //         underline: s.underline,
+        //         strikethrough: s.strikethrough,
+        //     }
+        // };
+        // let text_content = spans.iter().map(|s| to_span(s)).collect::<Vec<Span>>();
+        // let text = Text {
+        //     content: text_content.as_ref(),
+        //     bounds: text_bounds,
         //     size: text_size,
+        //     line_height: self.line_height,
+        //     font: self.font.unwrap_or(iced::Font::DEFAULT),
         //     align_x: text::Alignment::Default,
         //     align_y: alignment::Vertical::Center,
         //     shaping: text::Shaping::Advanced,
         //     wrapping: text::Wrapping::default(),
         // };
-
+        // state.paragraph = Paragraph::with_spans(text);
         let text = layout::Node::new(text_bounds).move_to(Point::new(padding.left, padding.top));
 
         layout::Node::with_children(text_bounds.expand(padding), vec![text])
@@ -194,108 +313,89 @@ impl<'a> Widget<Message, Theme, iced::Renderer> for RichTextEditor<'a> {
     fn draw(
         &self,
         tree: &Tree,
-        renderer: &mut iced::Renderer,
+        renderer: &mut Renderer,
         theme: &Theme,
         style: &renderer::Style,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         viewport: &Rectangle,
     ) {
-        let state = tree.state.downcast_ref::<EditorState>();
-        let bounds = layout.bounds();
-        let text_size = self.text_size.unwrap_or_else(|| renderer.default_size()).0;
+        let state = tree
+            .state
+            .downcast_ref::<EditorState<Renderer::Paragraph>>();
+        // let value = "Value String not placeholder";
+        // // let is_disabled = self.on_input.is_none();
 
-        // Draw background
+        if state.requires_redraw.replace(false) {
+            println!("Going to draw cuz values changed");
+        }
+
+        let bounds = layout.bounds();
+        // dbg!(bounds);
+        let mut children_layout = layout.children();
+        let text_bounds = children_layout.next().unwrap().bounds();
+
+        // // let style = theme.style(&self.class, self.last_status.unwrap_or(Status::Disabled));
+
         renderer.fill_quad(
-            Quad {
-                bounds,
-                ..Quad::default()
+            renderer::Quad {
+                bounds: *viewport,
+                // border: Bord,
+                ..renderer::Quad::default()
             },
             Color::WHITE,
         );
 
-        let mut y_offset = bounds.y + self.padding.top;
+        // let text = state.document.text.to_string(); //value.to_string();
+        for (i, paragraph) in state.render_cache.segments.iter().enumerate() {
+            let viewport = text_bounds;
 
-        for (line_index, line) in state.content.lines.iter().enumerate() {
-            let line_height = self.line_height.to_absolute(Pixels(text_size)).0;
+            // let draw = |renderer: &mut Renderer, viewport| {
+            // };
 
-            // Draw line selection background
-            if line.selected {
-                let line_bounds = Rectangle {
-                    x: bounds.x,
-                    y: y_offset,
-                    width: bounds.width,
-                    height: line_height,
-                };
-                renderer.fill_quad(
-                    Quad {
-                        bounds: line_bounds,
-                        ..Quad::default()
-                    },
-                    Color::from_rgba(0.7, 0.9, 1.0, 0.3), // Light blue selection
-                );
-            }
+            let alignment_offset =
+                alignment_offset(text_bounds.width, paragraph.min_width(), self.alignment);
+            let  position =
+                text_bounds.anchor(paragraph.min_bounds(), Alignment::Start, Alignment::Center)
+                    + Vector::new(alignment_offset - 0.0, 0.0 );
+            // dbg!(position);
+            renderer.with_translation(Vector::ZERO, |_| {});
 
-            // Draw text for each span in the line
-            let mut x_offset = bounds.x + self.padding.left;
-            for span in &line.spans {
-                if !span.text.is_empty() {
-                    // Create font based on formatting
-                    let font = if span.bold {
-                        // Use bold weight
-                        Font {
-                            weight: iced::font::Weight::Bold,
-                            ..span.font
-                        }
-                    } else {
-                        span.font
-                    };
-
-                    let text_element = Text {
-                        content: span.text.clone(),
-                        bounds: Size::new(f32::INFINITY, line_height),
-                        size: Pixels(span.size),
-                        line_height: self.line_height,
-                        font,
-                        align_x: text::Alignment::Default,
-                        align_y: alignment::Vertical::Top,
-                        shaping: Shaping::Advanced,
-                        wrapping: Wrapping::None,
-                    };
-
-                    renderer.fill_text(
-                        text_element,
-                        Point { x: x_offset, y: y_offset },
-                        span.color,
-                        *viewport,
-                    );
-
-                    // Simple width calculation (in a real implementation, you'd measure the text)
-                    x_offset += span.text.len() as f32 * span.size * 0.6;
-                }
-            }
-
-            // Draw cursor if this is the current line
-            if line_index == state.content.current_line {
-                let cursor_x = bounds.x + self.padding.left +
-                    state.content.cursor_position as f32 * text_size * 0.6;
-                let cursor_bounds = Rectangle {
-                    x: cursor_x,
-                    y: y_offset,
-                    width: 2.0,
-                    height: line_height,
-                };
-                renderer.fill_quad(
-                    Quad {
-                        bounds: cursor_bounds,
-                        ..Quad::default()
-                    },
-                    Color::BLACK,
-                );
-            }
-
-            y_offset += line_height;
+            renderer.fill_paragraph(paragraph, position, Color::BLACK, viewport);
         }
+
+        // let text = Text {
+        //     content: self.placeholder.as_str(),
+        //     bounds: layout.bounds().size(),
+        //     size: self.text_size.unwrap_or_else(|| renderer.default_size()),
+        //     line_height: self.line_height,
+        //     font: self.font.unwrap_or_else(|| renderer.default_font()),
+        //     align_x: text::Alignment::Default,
+        //     align_y: alignment::Vertical::Center,
+        //     shaping: text::Shaping::Advanced,
+        //     wrapping: text::Wrapping::default(),
+        // };
+
+        // let text = Text {
+        //     content: state
+        //         .content
+        //         .text
+        //         .slice(..)
+        //         .as_str()
+        //         .unwrap_or("Default Text")
+        //         .to_owned(),
+        //     bounds: layout.bounds().size(),
+        //     size: self.text_size.unwrap_or_else(|| renderer.default_size()),
+        //     line_height: self.line_height,
+        //     font: self.font.unwrap_or_else(|| renderer.default_font()),
+        //     align_x: text::Alignment::Default,
+        //     align_y: alignment::Vertical::Center,
+        //     shaping: text::Shaping::Advanced,
+        //     wrapping: text::Wrapping::default(),
+        // };
+
+        // renderer.fill_text(text, Point { x: 10., y: 10. }, Color::WHITE, *viewport);
+        println!("DID IT PRINT?????????")
     }
 
     fn mouse_interaction(
@@ -304,7 +404,7 @@ impl<'a> Widget<Message, Theme, iced::Renderer> for RichTextEditor<'a> {
         _layout: Layout<'_>,
         _cursor: mouse::Cursor,
         _viewport: &Rectangle,
-        _renderer: &iced::Renderer,
+        _renderer: &Renderer,
     ) -> mouse::Interaction {
         mouse::Interaction::Text
     }
@@ -315,196 +415,175 @@ impl<'a> Widget<Message, Theme, iced::Renderer> for RichTextEditor<'a> {
         event: &iced::Event,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
-        renderer: &iced::Renderer,
+        renderer: &Renderer,
         clipboard: &mut dyn iced::advanced::Clipboard,
         shell: &mut iced::advanced::Shell<'_, Message>,
         viewport: &Rectangle,
     ) {
-        let state = tree.state.downcast_mut::<EditorState>();
-        let bounds = layout.bounds();
-        let text_size = self.text_size.unwrap_or_else(|| renderer.default_size()).0;
-        let line_height = self.line_height.to_absolute(Pixels(text_size)).0;
-
         match event {
             iced::Event::Keyboard(event) => {
+                let state = tree
+                    .state
+                    .downcast_mut::<EditorState<Renderer::Paragraph>>();
+
                 match event {
                     iced::keyboard::Event::KeyPressed {
                         key,
+                        modified_key,
+                        physical_key,
+                        location,
                         modifiers,
                         text,
-                        ..
+                        repeat,
                     } => {
-                        let mut should_redraw = true;
-                        let mut message = None;
+                        // iced::widget::rich_text(spans);
 
-                        match key {
-                            iced::keyboard::Key::Character(c) if !modifiers.control() && !modifiers.alt() => {
-                                if let Some(ch) = c.chars().next() {
-                                    state.content.insert_char(ch);
-                                    if let Some(ref callback) = self.on_change {
-                                        message = Some(callback(state.content.text()));
-                                    }
-                                }
-                            }
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter) => {
-                                state.content.insert_newline();
-                                if let Some(ref callback) = self.on_change {
-                                    message = Some(callback(state.content.text()));
-                                }
-                            }
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::Backspace) => {
-                                state.content.delete_char();
-                                if let Some(ref callback) = self.on_change {
-                                    message = Some(callback(state.content.text()));
-                                }
-                            }
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowLeft) => {
-                                if modifiers.control() {
-                                    // Move to previous line
-                                    state.content.move_cursor_up();
-                                } else {
-                                    state.content.move_cursor_left();
-                                }
-                            }
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowRight) => {
-                                if modifiers.control() {
-                                    // Move to next line
-                                    state.content.move_cursor_down();
-                                } else {
-                                    state.content.move_cursor_right();
-                                }
-                            }
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp) => {
-                                state.content.move_cursor_up();
-                            }
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowDown) => {
-                                state.content.move_cursor_down();
-                            }
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::PageUp) if modifiers.alt() => {
-                                // Move current line up
-                                let current_line = state.content.current_line;
-                                state.content.move_line_up(current_line);
-                                if let Some(ref callback) = self.on_line_move {
-                                    message = Some(callback(current_line, current_line.saturating_sub(1)));
-                                }
-                            }
-                            iced::keyboard::Key::Named(iced::keyboard::key::Named::PageDown) if modifiers.alt() => {
-                                // Move current line down
-                                let current_line = state.content.current_line;
-                                state.content.move_line_down(current_line);
-                                if let Some(ref callback) = self.on_line_move {
-                                    message = Some(callback(current_line, current_line + 1));
-                                }
-                            }
-                            iced::keyboard::Key::Character(c) if c == "b" && modifiers.control() => {
-                                // Toggle bold formatting
-                                state.content.toggle_bold_at_cursor();
-                                if let Some(ref callback) = self.on_change {
-                                    message = Some(callback(state.content.text()));
-                                }
-                            }
-                            _ => {
-                                should_redraw = false;
-                            }
-                        }
+                        if let Some(text) = text {
+                            if let Some(c) = text.chars().next().filter(|c| !c.is_control()) {
+                                state.insert(c);
+                                state.update_render_caches(renderer, layout);
 
-                        if should_redraw {
-                            shell.request_redraw();
-                        }
-                        if let Some(msg) = message {
-                            shell.publish(msg);
-                        }
-                        shell.capture_event();
-                    }
-                    _ => {}
-                }
-            }
-            iced::Event::Mouse(event) => {
-                match event {
-                    iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left) => {
-                        if let Some(cursor_pos) = cursor.position_in(bounds) {
-                            let line_index = ((cursor_pos.y - self.padding.top) / line_height) as usize;
-                            if line_index < state.content.lines.len() {
-                                state.content.select_line(line_index);
-                                state.content.current_line = line_index;
-                                state.content.cursor_position = 0; // Reset cursor to start of line
+                                dbg!(c);
 
-                                if let Some(ref callback) = self.on_line_select {
-                                    shell.publish(callback(line_index));
-                                }
+                                shell.capture_event();
+
+                                // focus.updated_at = Instant::now();
+                                // replace_paragraph(
+                                //     renderer,
+                                //     state,
+                                //     layout,
+                                //     self.font,
+                                //     self.text_size,
+                                //     self.line_height,
+                                // );
                                 shell.request_redraw();
+                                return;
                             }
                         }
                     }
-                    _ => {}
+                    iced::keyboard::Event::KeyReleased {
+                        key,
+                        modified_key,
+                        physical_key,
+                        location,
+                        modifiers,
+                    } => {}
+
+                    iced::keyboard::Event::ModifiersChanged(modifiers) => {}
                 }
             }
+            // iced::Event::Mouse(event) => todo!(),
+            // iced::Event::Window(event) => todo!(),
+            // iced::Event::Touch(event) => todo!(),
+            // iced::Event::InputMethod(event) => todo!(),
             _ => {}
         }
     }
 }
 
-impl operation::TextInput for EditorState {
-    fn text(&self) -> &str {
-        // For simplicity, return the text of the current line
-        // In a full implementation, this would need to handle the entire document
-        if let Some(line) = self.content.lines.get(self.content.current_line) {
-            // This is a temporary solution - ideally we'd store the text as a String field
-            // For now, we'll return an empty string to avoid the borrow checker issue
-            ""
-        } else {
-            ""
-        }
-    }
+// impl<P: Paragraph> operation::TextInput for EditorState<P> {
+//     fn text(&self) -> &str {
+//         self.content.text.slice(0..).as_str().unwrap_or("")
+//     }
 
-    fn move_cursor_to_front(&mut self) {
-        self.content.current_line = 0;
-        self.content.cursor_position = 0;
-    }
+//     fn move_cursor_to_front(&mut self) {
+//         // self.cursor.move_to(0);
+//     }
 
-    fn move_cursor_to_end(&mut self) {
-        self.content.current_line = self.content.lines.len().saturating_sub(1);
-        self.content.cursor_position = self.content.lines[self.content.current_line].spans[0].text.len();
-    }
+//     fn move_cursor_to_end(&mut self) {
+//         // self.cursor.move_to(usize::MAX);
+//     }
 
-    fn move_cursor_to(&mut self, position: usize) {
-        // Simplified - would need proper text position calculation
-        self.move_cursor_to_front();
-        for _ in 0..position {
-            self.content.move_cursor_right();
-        }
-    }
+//     fn move_cursor_to(&mut self, position: usize) {
+//         // self.cursor.move_to(position);
+//     }
 
-    fn select_all(&mut self) {
-        for line in &mut self.content.lines {
-            line.selected = true;
-        }
-    }
+//     fn select_all(&mut self) {
+//         // self.cursor.select_range(0, usize::MAX);
+//     }
 
-    fn select_range(&mut self, start: usize, end: usize) {
-        // Simplified selection - would need proper implementation
-        self.select_all();
-    }
-}
+//     fn select_range(&mut self, start: usize, end: usize) {
+//         // self.cursor.select_range(start, end);
+//     }
+// }
 
-fn measure_cursor_and_scroll_offset(
-    paragraph: &impl Paragraph,
-    text_bounds: Rectangle,
-    cursor_index: usize,
-) -> (f32, f32) {
-    let grapheme_position = paragraph
-        .grapheme_position(0, cursor_index)
-        .unwrap_or(Point::ORIGIN);
+// fn measure_cursor_and_scroll_offset(
+//     paragraph: &impl Paragraph,
+//     text_bounds: Rectangle,
+//     cursor_index: usize,
+// ) -> (f32, f32) {
+//     let grapheme_position = paragraph
+//         .grapheme_position(0, cursor_index)
+//         .unwrap_or(Point::ORIGIN);
 
-    let offset = ((grapheme_position.x + 5.0) - text_bounds.width).max(0.0);
+//     let offset = ((grapheme_position.x + 5.0) - text_bounds.width).max(0.0);
+// }
 
-    (grapheme_position.x, offset)
-}
+// fn replace_paragraph<P: Paragraph<Font = iced::Font>, Renderer>(
+//     renderer: &Renderer,
+//     state: &mut EditorState<P>,
+//     layout: Layout<'_>,
+//     font: Option<iced::Font>,
+//     text_size: Option<Pixels>,
+//     line_height: LineHeight,
+// ) where
+//     Renderer: iced::advanced::text::Renderer<Font = iced::Font>,
+// {
+//     let font = font.unwrap_or(iced::Font::DEFAULT);
+//     let text_size = text_size.unwrap_or_else(|| renderer.default_size());
+
+//     let mut children_layout = layout.children();
+//     let text_bounds = children_layout.next().unwrap().bounds();
+
+//     let spans: Vec<RichTextSpan> = state
+//         .document
+//         .lines
+//         .iter()
+//         .flat_map(|l| l.spans.iter())
+//         .map(|&s| s)
+//         .collect();
+//     dbg!(&state.document);
+//     let to_span = |s: &RichTextSpan| -> Span {
+//         let text = state.document.text.slice(s.start..s.end);
+//         // .slice
+//         // .expect("HOW DID THE SLICE GET EMPTY")
+//         // .as_str()
+//         // .expect("Converting a rope slice to a &str is the culprit");
+//         Span {
+//             text: text.into(),
+//             size: s.size,
+//             line_height: s.line_height,
+//             font: s.font,
+//             color: s.color,
+//             link: s.link,
+//             highlight: s.highlight,
+//             padding: s.padding,
+//             underline: s.underline,
+//             strikethrough: s.strikethrough,
+//         }
+//     };
+
+//     let text_content = spans.iter().map(|s| to_span(s)).collect::<Vec<Span>>();
+//     let text = Text {
+//         content: text_content.as_ref(),
+//         bounds: text_bounds.size(),
+//         size: text_size,
+//         line_height: line_height,
+//         font: font,
+//         align_x: text::Alignment::Default,
+//         align_y: alignment::Vertical::Center,
+//         shaping: text::Shaping::Advanced,
+//         wrapping: text::Wrapping::default(),
+//     };
+//     state.paragraph = Paragraph::with_spans(text);
+// }
+
+pub type CursorOffset = usize;
 
 #[derive(Debug, Clone)]
 pub enum Cursor {
-    Index(usize),
-    Selection(usize, usize),
+    Index(CursorOffset),
+    Selection(CursorOffset, CursorOffset),
 }
 
 impl Default for Cursor {
@@ -522,20 +601,223 @@ impl Cursor {
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct EditorState {
-    content: EditorContent,
-    last_span_start: usize,
-    preedit: Option<input_method::Preedit>,
-    last_click: Option<mouse::Click>,
-    drag_start: Option<Point>,
-    is_dragging: bool,
-}
-
-impl EditorState {
-    /// Creates a new [`EditorState`], representing an unfocused [`RichTextEditor`].
+impl<P: Paragraph<Font = iced::Font>> EditorState<P> {
+    /// Creates a new [`EditorState`], representing an unfocused [`TextInput`].
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            requires_redraw: Cell::new(true),
+            ..Default::default()
+        }
+    }
+
+    pub fn insert(self: &mut Self, ch: char) {
+        let cursor_pos = self.get_cursor_pos();
+        self.requires_redraw = Cell::new(true);
+
+        if self.document.lines.is_empty() {
+            let mut line = Line::default();
+            let span = RichTextSpan {
+                start: 0,
+                end: 1,
+                // size: None,
+                // line_height: None,
+                // font: None,
+                // color: None,
+                // link: None,
+                // highlight: None,
+                // padding: Padding::default(),
+                // underline: false,
+                // strikethrough: false,
+                formatting: Formatting::default(),
+            };
+            self.document.text.insert_char(cursor_pos, ch);
+            //then update the span
+            line.spans.push(span);
+            self.document.lines.push(line);
+            // must be last, if there is an error before inserting, we should not update the cursor pos.
+            self.cursor.inc();
+            return;
+        }
+
+        let (line, col) = {
+            let start_time = Instant::now();
+
+            let line_idx = self.document.text.char_to_line(cursor_pos);
+            let line_start_offset = self.document.text.line_to_char(line_idx);
+
+            let col = cursor_pos - line_start_offset;
+            let line = self.document.lines.get_mut(line_idx).expect(&format!("Accessing line at index = {}, should be possible. This line should be present as it is present in the rope.", line_idx));
+
+            let elapsed = start_time.elapsed();
+            println!(
+                "Time took for converting cursor offset from document to lines and cols => {:?}",
+                elapsed
+            );
+
+            (line, col)
+        };
+        println!("CursorPos To Find: {}", cursor_pos);
+        let span = match line
+            .spans
+            .iter()
+            .position(|s| cursor_pos >= s.start && cursor_pos <= s.end + 1)
+        {
+            Some(idx) => {
+                println!("Span found at index: {}", idx);
+                //then update the span
+                // span.end = col + 1;
+                line.spans[idx].end += 1;
+
+                // insert to doc
+                self.document.text.insert_char(cursor_pos, ch);
+
+                // span.slice = Some(self.document.text.slice(span.start..span.end));
+
+                // must be last, if there is an error before inserting, we should not update the cursor pos.
+                self.cursor.inc();
+            }
+            None => {
+                unreachable!();
+                // let span = RichTextSpan {
+                //     start: col,
+                //     end: col,
+                //     size: None,
+                //     line_height: None,
+                //     font: None,
+                //     color: None,
+                //     link: None,
+                //     highlight: None,
+                //     padding: Padding::default(),
+                //     underline: false,
+                //     strikethrough: false,
+                // };
+                // line.spans.push(span);
+                // span
+            }
+        };
+    }
+
+    fn update_render_caches<Renderer>(&mut self, renderer: &Renderer, layout: Layout<'_>)
+    where
+        Renderer: iced::advanced::text::Renderer<Font = iced::Font>,
+    {
+        dbg!(&self.document);
+        dbg!(&self.render_cache.lines);
+        dbg!(&self.render_cache.segments.len());
+        let cursor_pos = self.get_cursor_pos();
+        let line_idx = self.document.text.char_to_line(cursor_pos);
+        let line = self.document.lines.get(line_idx).expect(&format!("Accessing line at index = {}, should be possible. This line should be present as it is present in the rope.", line_idx));
+
+        let bounds = layout.bounds().size();
+
+        if let Some(line) = self.render_cache.lines.get(line_idx){
+            let start = line.start;
+            let end = line.end;
+            println!("Removing Segments from indices: {} to {}", start, end);
+            for i in start..=end {
+                self.render_cache.segments.remove(i);
+            }
+            self.render_cache.lines.remove(line_idx);
+        }
+
+        if line.needs_multiple_fonts() {
+            let mut iter = line.spans.iter();
+            let first = iter
+                .next()
+                .expect("Calling next span won't cause panic cause it is checked elsewhere");
+            let prev_font = first.formatting.font_style;
+
+            let mut start = first.start;
+            let mut end = first.end;
+            let last_idx = line.spans.len() - 1;
+
+            for (i, span) in iter.enumerate() {
+                let curr_font = span.formatting.font_style;
+                if curr_font == prev_font {
+                    end = span.end;
+                } else {
+                    // create a paragraph and add it to cache and start a new one
+                    let content = self.document.content(start, end).to_string();
+                    let text: Text<&str, iced::Font> = Text {
+                        content: &content,
+                        bounds: bounds,
+                        size: line.format.size.unwrap_or_else(|| renderer.default_size()),
+                        line_height: line
+                            .format
+                            .line_height
+                            .unwrap_or_else(|| LineHeight::default()),
+                        font: line.format.font.unwrap_or_else(|| {
+                            let mut font = renderer.default_font();
+                            font.weight = Weight::Bold;
+                            font
+                        }),
+                        align_x: line.format.align_x.unwrap_or(text::Alignment::Default),
+                        align_y: line.format.align_y.unwrap_or(alignment::Vertical::Center),
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::default(),
+                    };
+
+                    self.render_cache
+                        .add_segment(line_idx, Paragraph::with_text(text));
+
+                    start = end;
+                    end = span.end
+                }
+
+                if i == last_idx {
+                    let content = self.document.content(start, end).to_string();
+                    let text: Text<&str, iced::Font> = Text {
+                        content: &content,
+                        bounds: bounds,
+                        size: line.format.size.unwrap_or_else(|| renderer.default_size()),
+                        line_height: line
+                            .format
+                            .line_height
+                            .unwrap_or_else(|| LineHeight::default()),
+                        font: line.format.font.unwrap_or_else(|| renderer.default_font()),
+                        align_x: line.format.align_x.unwrap_or(text::Alignment::Default),
+                        align_y: line.format.align_y.unwrap_or(alignment::Vertical::Center),
+                        shaping: text::Shaping::Advanced,
+                        wrapping: text::Wrapping::default(),
+                    };
+                    self.render_cache
+                        .add_segment(line_idx, Paragraph::with_text(text));
+                }
+            }
+        } else {
+            let (start, end) = line.text_span();
+            let content = self.document.content(start, end).to_string();
+            let text: Text<&str, iced::Font> = Text {
+                content: &content,
+                bounds: bounds,
+                size: line.format.size.unwrap_or_else(|| renderer.default_size()),
+                line_height: line
+                    .format
+                    .line_height
+                    .unwrap_or_else(|| LineHeight::default()),
+                font: line.format.font.unwrap_or_else(|| renderer.default_font()),
+                align_x: line.format.align_x.unwrap_or(text::Alignment::Default),
+                align_y: line.format.align_y.unwrap_or(alignment::Vertical::Center),
+                shaping: text::Shaping::Advanced,
+                wrapping: text::Wrapping::default(),
+            };
+
+            println!("Adding New Segments ");
+            self.render_cache
+                .add_segment(line_idx, Paragraph::with_text(text));
+        }
+    }
+
+    pub fn get_cursor_pos(self: &Self) -> CursorOffset {
+        match self.cursor {
+            Cursor::Index(pos) => pos,
+            Cursor::Selection(start, end) => {
+                println!(
+                    "You asked for cursor_pos while there is a selection, so giving you the end of the selection"
+                );
+                end
+            }
+        }
     }
 }
 
@@ -551,155 +833,6 @@ fn alignment_offset(
             alignment::Horizontal::Left => 0.0,
             alignment::Horizontal::Center => (text_bounds_width - text_min_width) / 2.0,
             alignment::Horizontal::Right => text_bounds_width - text_min_width,
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct EditorContent {
-    lines: Vec<RichLine>,
-    current_line: usize,
-    cursor_position: usize, // position within current line
-}
-
-impl Default for EditorContent {
-    fn default() -> Self {
-        Self {
-            lines: vec![RichLine::new()],
-            current_line: 0,
-            cursor_position: 0,
-        }
-    }
-}
-
-impl EditorContent {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn text(&self) -> String {
-        self.lines.iter().map(|line| line.text()).collect::<Vec<_>>().join("\n")
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        if self.current_line >= self.lines.len() {
-            self.lines.push(RichLine::new());
-        }
-
-        let line = &mut self.lines[self.current_line];
-        if line.spans.is_empty() {
-            line.spans.push(RichSpan::default());
-        }
-
-        let span = &mut line.spans[0];
-        span.text.insert(self.cursor_position, c);
-        self.cursor_position += 1;
-    }
-
-    pub fn insert_newline(&mut self) {
-        let current_line = &mut self.lines[self.current_line];
-        let remaining_text = current_line.spans[0].text.split_off(self.cursor_position);
-
-        let new_line = RichLine::new();
-        self.lines.insert(self.current_line + 1, new_line);
-        self.lines[self.current_line + 1].spans[0].text = remaining_text;
-
-        self.current_line += 1;
-        self.cursor_position = 0;
-    }
-
-    pub fn delete_char(&mut self) {
-        if self.cursor_position > 0 {
-            let line = &mut self.lines[self.current_line];
-            line.spans[0].text.remove(self.cursor_position - 1);
-            self.cursor_position -= 1;
-        } else if self.current_line > 0 {
-            // Join with previous line
-            let current_text = self.lines[self.current_line].spans[0].text.clone();
-            self.lines.remove(self.current_line);
-            self.current_line -= 1;
-            self.cursor_position = self.lines[self.current_line].spans[0].text.len();
-            self.lines[self.current_line].spans[0].text.push_str(&current_text);
-        }
-    }
-
-    pub fn move_cursor_left(&mut self) {
-        if self.cursor_position > 0 {
-            self.cursor_position -= 1;
-        } else if self.current_line > 0 {
-            self.current_line -= 1;
-            self.cursor_position = self.lines[self.current_line].spans[0].text.len();
-        }
-    }
-
-    pub fn move_cursor_right(&mut self) {
-        let line_len = self.lines[self.current_line].spans[0].text.len();
-        if self.cursor_position < line_len {
-            self.cursor_position += 1;
-        } else if self.current_line < self.lines.len() - 1 {
-            self.current_line += 1;
-            self.cursor_position = 0;
-        }
-    }
-
-    pub fn move_cursor_up(&mut self) {
-        if self.current_line > 0 {
-            self.current_line -= 1;
-            let line_len = self.lines[self.current_line].spans[0].text.len();
-            self.cursor_position = self.cursor_position.min(line_len);
-        }
-    }
-
-    pub fn move_cursor_down(&mut self) {
-        if self.current_line < self.lines.len() - 1 {
-            self.current_line += 1;
-            let line_len = self.lines[self.current_line].spans[0].text.len();
-            self.cursor_position = self.cursor_position.min(line_len);
-        }
-    }
-
-    pub fn toggle_bold_at_cursor(&mut self) {
-        if self.current_line >= self.lines.len() {
-            return;
-        }
-
-        let line = &mut self.lines[self.current_line];
-        if line.spans.is_empty() {
-            return;
-        }
-
-        // For simplicity, toggle bold on the current span
-        // In a more advanced implementation, this would handle span splitting
-        if let Some(span) = line.spans.get_mut(0) {
-            span.bold = !span.bold;
-        }
-    }
-
-    pub fn select_line(&mut self, line_index: usize) {
-        for (i, line) in self.lines.iter_mut().enumerate() {
-            line.selected = i == line_index;
-        }
-    }
-
-    pub fn move_line_up(&mut self, line_index: usize) {
-        if line_index > 0 {
-            self.lines.swap(line_index, line_index - 1);
-            if self.current_line == line_index {
-                self.current_line -= 1;
-            } else if self.current_line == line_index - 1 {
-                self.current_line += 1;
-            }
-        }
-    }
-
-    pub fn move_line_down(&mut self, line_index: usize) {
-        if line_index < self.lines.len() - 1 {
-            self.lines.swap(line_index, line_index + 1);
-            if self.current_line == line_index {
-                self.current_line += 1;
-            } else if self.current_line == line_index + 1 {
-                self.current_line -= 1;
-            }
         }
     }
 }
